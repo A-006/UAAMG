@@ -1,0 +1,574 @@
+================================================================================
+从可编程角度：最基础代码实现
+——从零构建矩阵无关 Poisson 求解器
+================================================================================
+
+【层级0：概念 → 代码的映射】
+
+  论文概念             →  编程对应
+  ────────────────────────────────────────────
+  Poisson 方程 ∇²p = b → Ax = b (离散线性系统)
+  交错网格(MAC Grid)    → 3D数组 + 偏移索引
+  DoF (自由度)          → 非固体的网格单元 = 需要求解的变量
+  对角/非对角系数       → Laplacian 模板权重 / 相邻单元数
+  RBGS 平滑             → 逐点更新 x_i = (b_i - Σa_ij x_j) / a_ii
+  限制(Restriction)      → 8→1 平均池化
+  延长(Prolongation)    → 最近邻上采样
+  CG 迭代               → 搜索方向 + 步长更新
+
+================================================================================
+
+【层级1：最简单的 Poisson 求解器 —— 2D Jacobi 迭代 (Python)】
+
+这是理解一切的起点。50行代码，不需要任何库。
+
+"""
+最简 2D Poisson 求解器 - Jacobi 迭代
+知识点：离散Laplacian, 矩阵无关计算, 迭代法收敛
+"""
+import numpy as np
+
+def solve_poisson_2d_jacobi(N, max_iter=5000, tol=1e-6):
+    """
+    求解 ∇²x = b  在 [0,1]×[0,1] 上, Dirichlet边界 x=0
+
+    N:       网格分辨率 (N×N 内部点)
+    网格间距: h = 1/(N+1)
+
+    5点Laplacian模板:
+            [0,  1, 0]
+            [1, -4, 1]
+            [0,  1, 0]
+
+    离散化: (x_{i+1,j} + x_{i-1,j} + x_{i,j+1} + x_{i,j-1} - 4*x_{i,j}) / h² = b_{i,j}
+    """
+    h = 1.0 / (N + 1)
+
+    # 未知数 x (含边界, 边界始终=0)
+    x = np.zeros((N+2, N+2))
+
+    # 右端项 b (制造一个已知解来验证: 真实解 = sin(πx)sin(πy))
+    b = np.zeros((N+2, N+2))
+    for i in range(1, N+1):
+        for j in range(1, N+1):
+            b[i,j] = -2.0 * np.pi**2 * np.sin(np.pi * i*h) * np.sin(np.pi * j*h)
+
+    # Jacobi 迭代
+    for it in range(max_iter):
+        x_old = x.copy()
+        resid_max = 0.0
+
+        for i in range(1, N+1):
+            for j in range(1, N+1):
+                # ─── 这是"矩阵无关"的核心 ───
+                # 不显式存储矩阵A, 直接用邻居值计算 Ax
+                Ax = (x_old[i+1,j] + x_old[i-1,j] +
+                      x_old[i,j+1] + x_old[i,j-1] - 4.0 * x_old[i,j]) / (h*h)
+
+                residual = b[i,j] - Ax
+                resid_max = max(resid_max, abs(residual))
+
+                # Jacobi 更新: x_new = x_old + ω * D^{-1} * residual
+                # D^{-1} = h²/(-4), ω=1 即 Jacobi
+                x[i,j] = x_old[i,j] + (h*h / -4.0) * residual
+
+        if resid_max < tol:
+            print(f"  Jacobi 收敛于 {it+1} 次迭代, 残差={resid_max:.2e}")
+            break
+
+    # 验证
+    true_x = np.zeros((N+2, N+2))
+    for i in range(N+2):
+        for j in range(N+2):
+            true_x[i,j] = np.sin(np.pi * i*h) * np.sin(np.pi * j*h)
+    error = np.max(np.abs(x[1:N+1, 1:N+1] - true_x[1:N+1, 1:N+1]))
+    print(f"  最大误差: {error:.2e}")
+    return x
+
+# 测试
+print("2D Poisson Jacobi (N=32):")
+solve_poisson_2d_jacobi(32)
+
+================================================================================
+
+【层级2：红黑 Gauss-Seidel (RBGS) —— 论文中使用的平滑器】
+
+为什么不用 Jacobi 而用 RBGS？
+- Jacobi: 每点更新用旧值 → 可并行，但收敛慢
+- GS: 每点用最新值 → 收敛快，但有数据依赖→难并行
+- RBGS: 红点更新(无依赖) → 黑点更新(用新红值) → 收敛接近GS且可并行！
+
+"""
+2D 红黑 Gauss-Seidel 平滑器
+"""
+import numpy as np
+
+def rbgs_smooth_2d(x, b, h, iterations=1):
+    """
+    对 Ax=b 执行 iterations 次 RBGS 平滑, 原地修改 x
+
+    x, b: (N+2)×(N+2) 数组, A 是 5点 Laplacian
+    """
+    N = x.shape[0] - 2  # 内部点数
+    inv_diag = h*h / -4.0  # 对角元的倒数, D^{-1}
+
+    for _ in range(iterations):
+        # ─── 红点 (i+j 为偶数) ───
+        # 红点之间不相邻, 全部可并行
+        for i in range(1, N+1):
+            for j in range(1 + (i % 2), N+1, 2):  # 跳过边界
+                # 5点Laplacian * x
+                Ax = (x[i+1,j] + x[i-1,j] +
+                      x[i,j+1] + x[i,j-1] - 4.0 * x[i,j]) / (h*h)
+                x[i,j] += inv_diag * (b[i,j] - Ax)
+
+        # ─── 黑点 (i+j 为奇数) ───
+        # 黑点用刚更新的红点值 → 收敛更快
+        for i in range(1, N+1):
+            for j in range(1 + ((i+1) % 2), N+1, 2):
+                Ax = (x[i+1,j] + x[i-1,j] +
+                      x[i,j+1] + x[i,j-1] - 4.0 * x[i,j]) / (h*h)
+                x[i,j] += inv_diag * (b[i,j] - Ax)
+
+# 快速对比 Jacobi vs RBGS 收敛速度
+def compare_smoothers(N=32):
+    h = 1.0/(N+1)
+    b = np.zeros((N+2, N+2))
+    for i in range(1, N+1):
+        for j in range(1, N+1):
+            b[i,j] = -2*np.pi**2 * np.sin(np.pi*i*h) * np.sin(np.pi*j*h)
+
+    # Jacobi
+    xj = np.zeros((N+2, N+2))
+    for it in range(500):
+        x_old = xj.copy()
+        for i in range(1,N+1):
+            for j in range(1,N+1):
+                Ax = (x_old[i+1,j]+x_old[i-1,j]+x_old[i,j+1]+x_old[i,j-1]-4*x_old[i,j])/(h*h)
+                xj[i,j] = x_old[i,j] + (h*h/-4)*(b[i,j]-Ax)
+        if np.max(np.abs(b[1:N+1,1:N+1] -
+                (xj[2:,1:N+1]+xj[:N,1:N+1]+xj[1:N+1,2:]+xj[1:N+1,:N]-4*xj[1:N+1,1:N+1])/(h*h))) < 1e-6:
+            print(f"  Jacobi:  {it+1:4d} 次收敛")
+            break
+
+    # RBGS
+    xr = np.zeros((N+2, N+2))
+    for it in range(500):
+        rbgs_smooth_2d(xr, b, h, iterations=1)
+        res = np.max(np.abs(b[1:N+1,1:N+1] -
+                (xr[2:,1:N+1]+xr[:N,1:N+1]+xr[1:N+1,2:]+xr[1:N+1,:N]-4*xr[1:N+1,1:N+1])/(h*h)))
+        if res < 1e-6:
+            print(f"  RBGS:    {it+1:4d} 次收敛  (通常 Jacobi 的 ~50%)")
+            break
+
+compare_smoothers()
+
+================================================================================
+
+【层级3：共轭梯度法 (CG) —— 矩阵无关实现】
+
+CG 是最重要的一步。论文用它作为外层迭代器，UAAMG 作为预条件子。
+
+"""
+矩阵无关 Conjugate Gradient (无预条件)
+求解 Ax=b, A 是 5点 Laplacian
+"""
+import numpy as np
+
+def cg_solve_2d(b, h, max_iter=200, tol=1e-8):
+    """
+    纯 CG 求解, A 通过函数隐式定义 (矩阵无关)
+    b: (N+2)×(N+2), 边界值0
+    返回 x
+    """
+    N = b.shape[0] - 2
+    x = np.zeros_like(b)  # 初始猜测=0
+
+    # 矩阵向量乘 (5点Laplacian模板)
+    def matvec(v):
+        """返回 A*v, v有边界"""
+        Av = np.zeros_like(v)
+        Av[1:N+1, 1:N+1] = (v[2:N+2, 1:N+1] + v[:N, 1:N+1] +
+                             v[1:N+1, 2:N+2] + v[1:N+1, :N] -
+                             4.0 * v[1:N+1, 1:N+1]) / (h*h)
+        return Av
+
+    # 内积 (仅内部点)
+    def dot(a, b):
+        return np.sum(a[1:N+1, 1:N+1] * b[1:N+1, 1:N+1])
+
+    # ──── CG 主循环 ────
+    r = b - matvec(x)  # r = b - Ax
+    p = r.copy()       # p = r
+    rsold = dot(r, r)
+
+    for it in range(max_iter):
+        Ap = matvec(p)
+        alpha = rsold / dot(p, Ap)
+        x += alpha * p          # x = x + αp
+        r -= alpha * Ap         # r = r - αAp
+        rsnew = dot(r, r)
+
+        if np.sqrt(rsnew) < tol:
+            print(f"  CG 收敛于 {it+1} 次迭代")
+            break
+
+        beta = rsnew / rsold
+        p = r + beta * p        # p = r + βp
+        rsold = rsnew
+
+    return x
+
+# 测试 CG (纯CG vs Jacobi)
+def test_cg(N=32):
+    h = 1.0/(N+1)
+    b = np.zeros((N+2, N+2))
+    for i in range(1,N+1):
+        for j in range(1,N+1):
+            b[i,j] = -2*np.pi**2*np.sin(np.pi*i*h)*np.sin(np.pi*j*h)
+
+    print(f"  CG(N={N}):")
+    x = cg_solve_2d(b, h)
+
+    true_x = np.zeros((N+2,N+2))
+    for i in range(N+2):
+        for j in range(N+2):
+            true_x[i,j] = np.sin(np.pi*i*h)*np.sin(np.pi*j*h)
+    print(f"  最大误差: {np.max(np.abs(x[1:N+1,1:N+1]-true_x[1:N+1,1:N+1])):.2e}")
+
+test_cg()
+
+================================================================================
+
+【层级4：多重网格 V-Cycle —— 论文核心加速技术】
+
+这就是论文 Algorithm 3 的 Python 实现。
+
+"""
+2D 矩阵无关 UAAMG V-Cycle (预条件子)
+关键参数:
+  - 限制: 8→1 (3D), 简化用4→1 (2D) — 每维减半
+  - 延长: 常数插值 + ×2 缩放因子
+  - Galerkin: A_coarse = R * A_fine * P
+"""
+import numpy as np
+
+def build_hierarchy_2d(N):
+    """构建多重网格层级: [N, N/2, N/4, ...] 直到最小维度≥2"""
+    levels = [N]
+    while levels[-1] >= 4:  # 3D中最小维度=8, 2D=2
+        levels.append(levels[-1] // 2)
+    return levels
+
+def restrict_2d(r_fine):
+    """
+    限制算子 R: fine(2N) → coarse(N)
+    2D 中每 2×2 块取平均 (3D 中为 8→1)
+    """
+    Nc = (r_fine.shape[0] - 2) // 2
+    r_coarse = np.zeros((Nc+2, Nc+2))
+
+    # 仅对内部点做限制, 边界=0
+    for ic in range(1, Nc+1):
+        for jc in range(1, Nc+1):
+            i_f = 2*ic - 1  # 细网格的起始索引
+            j_f = 2*jc - 1
+            # 2×2 平均 = 4→1 (对应论文 3D 中的 8→1)
+            r_coarse[ic, jc] = 0.25 * (
+                r_fine[i_f, j_f] + r_fine[i_f+1, j_f] +
+                r_fine[i_f, j_f+1] + r_fine[i_f+1, j_f+1])
+    return r_coarse
+
+def prolongate_2d(x_coarse, scaling=2.0):
+    """
+    延长算子 P: coarse(N) → fine(2N)
+    常数插值 + ×2 缩放 (Stüben 2001 技巧提升 CG 预条件收敛)
+    """
+    Nc = x_coarse.shape[0] - 2
+    Nf = 2 * Nc
+    x_fine = np.zeros((Nf+2, Nf+2))
+
+    for ic in range(1, Nc+1):
+        for jc in range(1, Nc+1):
+            val = x_coarse[ic, jc] * scaling
+            i_f = 2*ic - 1
+            j_f = 2*jc - 1
+            # 每个粗格点膨胀为 2×2 块
+            x_fine[i_f,   j_f]   = val
+            x_fine[i_f+1, j_f]   = val
+            x_fine[i_f,   j_f+1] = val
+            x_fine[i_f+1, j_f+1] = val
+    return x_fine
+
+def v_cycle_2d(level_info, x, b, level=0):
+    """
+    递归 V-Cycle (Algorithm 3 的 Python 版)
+    level_info = [(N0, h0), (N1, h1), ...]
+    """
+    N, h = level_info[level]
+
+    # ─── 递归基: 最粗层直接求解 ───
+    if level == len(level_info) - 1:
+        for _ in range(10):  # 论文中: 最粗层多次 RBGS
+            rbgs_smooth_2d(x, b, h, iterations=1)
+        return
+
+    # ─── 下行程 ───
+    # 1. 前平滑 (1次RBGS)
+    rbgs_smooth_2d(x, b, h, iterations=1)
+
+    # 2. 计算残差并限制到粗层
+    #    r = b - Ax  (矩阵无关)
+    N_int = N
+    residual = np.zeros_like(b)
+    residual[1:N+1, 1:N+1] = b[1:N+1, 1:N+1] - (
+        x[2:N+2, 1:N+1] + x[:N, 1:N+1] +
+        x[1:N+1, 2:N+2] + x[1:N+1, :N] -
+        4.0 * x[1:N+1, 1:N+1]) / (h*h)
+
+    b_coarse = restrict_2d(residual)
+    Nc, hc = level_info[level + 1]
+    x_coarse = np.zeros((Nc+2, Nc+2))
+
+    # 3. 递归调用
+    v_cycle_2d(level_info, x_coarse, b_coarse, level + 1)
+
+    # ─── 上行程 ───
+    # 4. 延长粗层解并修正 (论文公式11: ×2 缩放)
+    correction = prolongate_2d(x_coarse, scaling=2.0)
+    x += correction
+
+    # 5. 后平滑 (1次RBGS)
+    rbgs_smooth_2d(x, b, h, iterations=1)
+
+def amgpcg_solve_2d(b, N, max_iter=50, tol=1e-8):
+    """
+    AMG-PCG 求解器 (论文第五章的简化2D版本)
+    V-Cycle 作为 CG 的预条件子
+    """
+    levels = build_hierarchy_2d(N)
+    level_info = [(n, 1.0/(n+1)) for n in levels]
+
+    x = np.zeros((N+2, N+2))
+
+    def matvec(v):
+        h = 1.0/(N+1)
+        Av = np.zeros_like(v)
+        Av[1:N+1, 1:N+1] = (v[2:N+2, 1:N+1] + v[:N, 1:N+1] +
+                             v[1:N+1, 2:N+2] + v[1:N+1, :N] -
+                             4.0 * v[1:N+1, 1:N+1]) / (h*h)
+        return Av
+
+    def dot(a, b):
+        return np.sum(a[1:N+1, 1:N+1] * b[1:N+1, 1:N+1])
+
+    # ──── PCG (预条件共轭梯度) ────
+    r = b - matvec(x)
+
+    # 预条件: z = M^{-1} r (用一次 V-Cycle)
+    z = np.zeros_like(r)
+    v_cycle_2d(level_info, z, r, level=0)
+    p = z.copy()
+
+    rsold = dot(r, z)
+
+    for it in range(max_iter):
+        Ap = matvec(p)
+        alpha = rsold / dot(p, Ap)
+        x += alpha * p
+        r -= alpha * Ap
+
+        resid_norm = np.sqrt(dot(r, r))
+        if resid_norm < tol:
+            print(f"  AMGPCG 收敛于 {it+1} 次迭代, 残差={resid_norm:.2e}")
+            break
+
+        # 预条件
+        z = np.zeros_like(r)
+        v_cycle_2d(level_info, z, r, level=0)
+
+        rsnew = dot(r, z)
+        beta = rsnew / rsold
+        p = z + beta * p
+        rsold = rsnew
+
+    return x
+
+# 对比三种方法
+def compare_all(N=64):
+    h = 1.0/(N+1)
+    b = np.zeros((N+2, N+2))
+    for i in range(1,N+1):
+        for j in range(1,N+1):
+            b[i,j] = -2*np.pi**2*np.sin(np.pi*i*h)*np.sin(np.pi*j*h)
+
+    true_x = np.zeros((N+2,N+2))
+    for i in range(N+2):
+        for j in range(N+2):
+            true_x[i,j] = np.sin(np.pi*i*h)*np.sin(np.pi*j*h)
+
+    print(f"\n{'='*50}")
+    print(f"2D Poisson N={N} (未知数={N*N})")
+    print(f"{'='*50}")
+
+    import time
+
+    # 1. Jacobi
+    t0 = time.time()
+    xj = np.zeros((N+2,N+2))
+    for it in range(5000):
+        x_old = xj.copy()
+        for i in range(1,N+1):
+            for j in range(1,N+1):
+                Ax = (x_old[i+1,j]+x_old[i-1,j]+x_old[i,j+1]+x_old[i,j-1]-4*x_old[i,j])/(h*h)
+                xj[i,j] = x_old[i,j] + (h*h/-4)*(b[i,j]-Ax)
+        if np.max(np.abs(b[1:N+1,1:N+1] -
+                (xj[2:,1:N+1]+xj[:N,1:N+1]+xj[1:N+1,2:]+xj[1:N+1,:N]-4*xj[1:N+1,1:N+1])/(h*h))) < 1e-6:
+            break
+    err_j = np.max(np.abs(xj[1:N+1,1:N+1]-true_x[1:N+1,1:N+1]))
+    print(f"  Jacobi:     {it+1:4d}次  {time.time()-t0:.3f}s  误差={err_j:.2e}")
+
+    # 2. CG (无预条件)
+    t0 = time.time()
+    xc = cg_solve_2d(b, h, max_iter=500)
+    err_c = np.max(np.abs(xc[1:N+1,1:N+1]-true_x[1:N+1,1:N+1]))
+    print(f"  CG:         N/A     {time.time()-t0:.3f}s  误差={err_c:.2e}")
+
+    # 3. AMGPCG
+    t0 = time.time()
+    xa = amgpcg_solve_2d(b, N, max_iter=50)
+    err_a = np.max(np.abs(xa[1:N+1,1:N+1]-true_x[1:N+1,1:N+1]))
+    print(f"  AMGPCG:     N/A     {time.time()-t0:.3f}s  误差={err_a:.2e}")
+
+compare_all(64)
+print("\n关键观察: AMGPCG 比纯 CG 收敛快 ~10× (迭代次数少得多了)")
+
+================================================================================
+
+【层级5：CUDA 核聚合 —— 论文 5.3 节的核心优化】
+
+这是论文最高性能技巧的伪代码 → 实际CUDA实现思路。
+
+"""
+论文 5.3 节: 聚合 CUDA 核 - 概念代码
+"""
+
+# ─── 分离核版 (慢) ───
+# 需要 3 次独立核启动, 每次读/写全局内存:
+
+__global__ void kernel_red_RBGS(float* x, float* b, float inv_h2, int N) {
+    // 核1: 红点 GS 平滑 → 写回全局内存
+}
+
+__global__ void kernel_black_RBGS(float* x, float* b, float inv_h2, int N) {
+    // 核2: 黑点 GS 平滑 → 写回全局内存
+}
+
+__global__ void kernel_restrict(float* r_fine, float* b_coarse, int N) {
+    // 核3: 残差限制 → 写回全局内存
+}
+// 问题: 6次全局内存读 + 4次全局内存写 = 10次全局内存访问
+
+# ─── 聚合核版 (快) ───
+# 1次核启动完成所有操作:
+
+__global__ void kernel_aggregated_RBGS_restrict(
+    float* x, float* b, float* b_coarse,
+    float inv_h2, int N, int Nc)
+{
+    // 每个 Block 处理一个 8×8×8 Tile (论文的数据结构)
+    int tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
+
+    // ── 阶段1: 共享内存加载 ──
+    __shared__ float tile_x[8+2][8+2][8+2];  // +2 用于 halo
+    // 加载 tile 数据 + 1层边界到 shared memory
+
+    // ── 阶段2: 红点 RBGS ──
+    // 仅曼哈顿距离<3 的体素, 用 shared memory 中的值
+    if (is_red(tx, ty, tz)) {
+        float Ax = compute_laplacian(tile_x, tx, ty, tz);
+        // ... 更新
+    }
+    __syncthreads();
+
+    // ── 阶段3: 黑点 RBGS ──
+    // 曼哈顿距离<2 的体素
+    if (is_black(tx, ty, tz)) {
+        float Ax = compute_laplacian(tile_x, tx, ty, tz);
+        // ... 更新
+    }
+    __syncthreads();
+
+    // ── 阶段4: 残差 + 限制 ──
+    float residual = b[idx] - compute_laplacian(tile_x, tx, ty, tz);
+    // 8→1 限制 (每个粗格点由 8 个细格点组成)
+    atomicAdd(&b_coarse[coarse_idx], 0.125f * residual);
+
+    // 写回: 仅1次全局内存写
+    x[idx] = tile_x[tx][ty][tz];
+}
+// 优化效果: 从 ~10次全局内存访问 → ~3次 (加载+写回+原子加)
+//           论文数据: 2× 加速 (聚合) + 再 2× (裁剪) = 总计 4×
+
+================================================================================
+
+【层级6：论文完整 AMGPCG 的数据流 (从代码视角)】
+
+输入: 速度场 ũ (需要投影为无散度)
+输出: u = ũ - ∇p (满足 ∇·u = 0)
+
+步骤 0: 构建右端项
+  b = -∇·ũ    (散度, 每体素 1 个标量)
+
+步骤 1: 标记 DoF (论文 5.2)
+  for 每个体素:
+      is_DoF[voxel] = (voxel 不是固体边界)
+  → 布尔通道
+
+步骤 2: 计算系数 (论文 5.4 裁剪)
+  for 每个体素:
+      diag[voxel] = -6  (3D Laplacian 对角, 或变系数)
+      如果 voxel 在边界:
+          off_diag_x/y/z[voxel] = 调整值
+  → 标记 trimmed tiles (自身+邻居全是均匀系数)
+  → 浮点通道
+
+步骤 3: 建立多重网格层级 (论文 5.1)
+  for level in range(nLevels):
+      如 level==0: grid = 原始分辨率
+      否则:       grid = grid[level-1] 做 8→1 限制
+      Galerkin: A_{level} = R * A_{level-1} * P (矩阵无关, 通过邻接隐式表达)
+
+步骤 4: PCG 迭代 (论文 5.3, 聚合核)
+  x=0, r=b, z=M^{-1}r, p=z
+  while 没收敛:
+      1. V-Cycle(z=r)  → 聚合核 (RBGS+Restrict+Prolong)
+      2. Ap = matmul(A, p)  → 聚合核 (含块内点积)
+      3. α = (r·z) / (p·Ap)
+      4. x += αp, r -= αAp
+      5. 检查收敛 (残差<阈值)
+
+步骤 5: 从 gauge 变量恢复速度
+  u = ũ - ∇x    (∇x 是 gauge 变量的梯度)
+  → 完成投影!
+
+================================================================================
+
+【总结：从最基础到论文实现的学习路径】
+
+  代码层级              对应论文概念          难度
+  ──────────────────────────────────────────────────
+  Jacobi迭代            平滑器基础            ★☆☆
+  RBGS平滑              Algorithm 3 的平滑器  ★★☆
+  CG求解器              PCG 的外层循环        ★★☆
+  Restrict/Prolong      V-Cycle 限制/延长     ★★☆
+  V-Cycle               多重网格递归          ★★★
+  PCG (预条件CG)        AMGPCG 完整算法       ★★★
+  矩阵无关+Coeff计算    论文5.1+5.2            ★★★
+  GPU Tiling (8³)      论文5.2数据结构        ★★★★
+  CUDA聚合核            论文5.3核心优化        ★★★★★
+  系数裁剪              论文5.4                ★★★★
+  完整3D AMGPCG GPU    论文第五章全实现        ★★★★★
+
+建议：按此顺序逐级实现，每级都独立可运行并验证正确性。
+      前5级可用 Python/NumPy, 后两级需要 CUDA C++。

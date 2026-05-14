@@ -1,0 +1,228 @@
+================================================================================
+第五章总结：Matrix-Free AMGPCG Solver on GPU
+——基于 Leapfrog Flow Maps 论文 (SIGGRAPH 2025)
+================================================================================
+
+一、本章核心问题
+
+流体模拟中，压力投影（Poisson方程求解）是性能瓶颈。LFM方法每步仍需多次投影，
+传统CPU求解器无法满足实时要求。本章提出GPU上矩阵无关的代数多重网格预条件
+共轭梯度（AMGPCG）求解器，将投影加速至与impulse演化相当的时间开销。
+
+================================================================================
+二、技术要点
+
+2.1 矩阵无关的UAAMG（Unsmoothed Aggregation Algebraic Multigrid）
+-----------------------------------------------------------------
+- 多重网格层级从细到粗，第 l 层方程：A_l x_l = b_l
+- 平滑器（RBGS，红黑Gauss-Seidel）消除高频误差
+- 粗化过程：残差通过限制算子 R_l 传递到粗层：b_{l+1} = R_l(b_l - A_l x_l^{old})
+- 延长过程：x_l^{new} = x_l^{old} + 2 P_l x_{l+1}（系数2提升CG预条件收敛速度）
+- 遵循Galerkin原理：A_{l+1} = R_l A_l P_l，使用8-to-1限制+常数延长
+- 矩阵无关特性：所有层级均不需显式存储矩阵，通过网格邻居关系隐式表达
+- 支持二阶精度 + 变系数Poisson方程 + Neumann/Dirichlet混合边界
+- 对比：
+  * 几何多重网格（McAdams 2010）：不支持变系数，一阶精度，不满足Galerkin
+  * AmgX等稀疏矩阵AMG库：基于稀疏矩阵，GPU上性能开销大
+  * UAAMG：矩阵无关、GPU友好、满足Galerkin原理
+
+2.2 数据结构（SOA + Tiling）
+-----------------------------
+- SOA（Structure of Arrays）布局：5个通道
+  * 1个布尔通道：标记体素是否为自由度（DoF，即非固体区域）
+  * 1个浮点通道：对角系数
+  * 3个浮点通道：3个轴向正方向的非对角系数
+- Tiling：网格划分为 8×8×8 的Tile
+  * 每个Tile内，同一通道数据连续存储 → 提升内存局部性
+  * Tile大小对齐CUDA共享内存容量 + Warp大小（32）的倍数
+- 体素内存索引通过位运算从笛卡尔坐标直接计算
+
+2.3 聚合CUDA核（Aggregated Kernels）
+--------------------------------------
+- 核心思想：AMGPCG的瓶颈是内存访问而非计算量，通过核聚合减少全局内存读写
+- V-Cycle中RBGS+Residual Restriction聚合为一个核，4个阶段：
+  阶段1：计算Tile曼哈顿距离<3的红色体素 x_l 值
+  阶段2：计算曼哈顿距离<2的黑色体素 Gauss-Seidel 平滑
+  阶段3：计算Tile内体素的残差
+  阶段4：残差限制到粗层，写回更新后的 x_l
+- 类似地，上行程中延长+Prolongation RBGS也可聚合
+- 点积聚合优化：
+  * CG每轮需2次点积
+  * 在前序CUDA核中完成逐块元素乘法和块内exclusive scan求和
+  * 核执行完毕后仅需一次全局exclusive scan
+  * 每轮CG迭代减少 7 个数据通道的全局内存访问
+- 效果：细层级 RBGS+Restriction 和 RBGS+Prolongation 分别提速 2x
+  单CG迭代总时间从 2.78ms → 0.81ms（256^3网格）
+
+2.4 系数裁剪（Coefficients Trimming）
+--------------------------------------
+- 仅边界附近Tile具有非均匀矩阵系数
+- 标记"已裁剪"Tile：该Tile及其所有邻居Tile系数均为均匀默认值
+- 被裁剪Tile直接使用默认系数，无需从全局内存读取 → 额外再提速 2x
+- 注意：邻居Tile也被纳入考虑，因为RBGS平滑需要相邻体素的系数
+
+================================================================================
+三、性能数据
+
+3.1 LFM vs NFM 性能对比（Leapfrog Vortex Rings, n=10）
+   操作          NFM        LFM       加速比
+   ───────────────────────────────────────
+   Marching      16.4 ms    4.8 ms    3.4×
+   Advection     2.5 ms     0.9 ms    2.8×（但有更少次数）
+   Pullback      0.4 ms     0.2 ms    2.0×（仅重初始化时）
+   Error Corr.   未单独列  0.03 ms   N/A
+   Projection    102.5 ms   7.9 ms    13.0×
+   Flow Map Reset 0.7 ms    0.06 ms   11.7×
+   Smoke操作     —         0.2 ms    —
+   总计          122.5 ms   14.1 ms   8.7×
+
+3.2 GPU求解器对比（128^3 / 256^3 / 512^3, 相对误差1e-6）
+   方法                128^3     256^3      512^3
+   迭代数   建立时间  求解时间
+   ────────────────────────────────────────────────
+   SIMD UAAMG (CPU)   14(15.4ms) 15(69.1ms) 16(556ms)   51ms   510ms   4531ms
+   我们(Separate)      4(0.07ms)  4(0.49ms)  4(3.44ms)  ~5.6ms  ~70ms   ~610ms
+   我们(Aggregate+Trim)4(0.15ms)  4(0.91ms)  4(6.78ms)  3.45ms  28.6ms  216ms
+   对比SIMD加速比：                                         14.8×   17.8×   21.0×
+
+3.3 各场景运行时间（RTX 4090）
+   场景                  分辨率          n  CG迭代  每步耗时  总耗时
+   Leapfrog Vortex Rings  256×128×128   10   15    14.1 ms   28.2 s
+   Head-on Collision      128×256×256    5    8    22.5 ms   22.5 s
+   Vortex Connection      384×256×256    5    8    70.0 ms  105.0 s
+   Wind Turbine           256×256×256    5    8    40.7 ms  203.5 s
+   Fire Ball（实时）      128×256×128    4    6    11.7 ms   14.0 s
+   Trefoil（实时）        128×128×128    5    6     5.6 ms   10.0 s
+   Delta Wing（实时）     256×128×128    5    6    11.1 ms   20.0 s
+
+================================================================================
+四、前置算法到本算法的全流程
+
+【层级0：数学物理基础】
+Navier-Stokes方程（不可压缩流体）
+  ρ Du/Dt = -∇p + μ∇²u + f
+  ∇·u = 0
+
+【层级1：Impulse（冲量）公式化 —— 第3章】
+  定义：m₀(x) = u₀(x)
+  输运方程：Dm/Dt = -(∇u)^T m
+  → 将N-S方程从速度表示转换为冲量表示（Hamilton形式）
+  → 关键优势：冲量天然保持涡量结构
+
+【层级2：Flow Map（流映射）方法】
+  前向流映射：Φ_{a,b}(X) = x  （从时刻a到b）
+  后向流映射：Ψ_{b,a}(x) = X  （逆向）
+  Jacobian矩阵：F_{a,b} = ∂Φ/∂X, T_{b,a} = ∂Ψ/∂x
+  Pullback重建：m_t(x) = T^T_{t,0}(x) u₀(Ψ_{t,0}(x))
+  速度恢复：u_t = m_t - ∇ξ + 路径积分（粘性+外力）
+  →
+  【NFM（Neural Flow Maps, Deng 2023）】
+    - 每步做双向marching + 中点投影
+    - 需要 O(k) 个速度缓存 + O(k) 步回退
+    - 精度高但计算量巨大：12n² + 52n marching + 2n 投影/周期
+    不适合实时
+
+【层级3：Leapfrog Flow Maps（上一步的算法）—— 第4章】
+  关键观察：只有重初始化时刻的impulse精度至关重要（决定未来演化）
+  → 中间步骤不需要冲量回退！
+
+  混合速度-冲量方案：
+  ┌─────────────────────────────────────────────────────┐
+  │ 中间步骤（Leapfrog + 速度对流）:                      │
+  │   u† ← u + (Δt/2ρ)(μ∇²u+f)          // 粘性前半步    │
+  │   ũ ← RK2-Advect(u†, u, Δt/2)      // Leapfrog对流 │
+  │   u ← Project(ũ)                     // 仅1次投影     │
+  │   交错式：第i步投影时刻 = 第i+1步对流中点            │
+  │                                                       │
+  │ 重初始化时（双向精确marching + 误差补偿）:              │
+  │   Ψ_{n,0}, T_{n,0} ← RK4-March(..., -Δt) // 回退n步 │
+  │   m_n ← T^T_{n,0} u₀(Ψ_{n,0})         // Pullback  │
+  │   û₀ ← F^T_{0,n} m_n(Φ_{0,n})         // 前向验证   │
+  │   e ← (û₀ - u₀)/2                     // 往返误差   │
+  │   m_n ← m_n - T^T_{n,0} e(Ψ_{n,0})    // 误差补偿   │
+  │   u_n ← Project(m_n)                  // 最终投影   │
+  └─────────────────────────────────────────────────────┘
+
+  效果：
+  - 投影次数：NFM的2n → LFM的n+1（减半）
+  - Marching步数：O(n²) → O(n)（n=20时减少76%）
+  - 精度：与NFM可比
+  - 支持粘性与外力（路径积分）
+
+【层级4：GPU AMGPCG求解器（本章的算法）—— 第5章】
+  ← 从LFM的Project步骤进入本章！
+
+  LFM每步需要 Project(ũ) 求解 Poisson 方程 ∇²ξ = f
+  → 离散化为大型稀疏线性系统 Ax = b
+  → 本章用矩阵无关UAAMG预条件的共轭梯度法在GPU上求解
+
+  完整求解流水线：
+  ┌──────────────────────────────────────────────────────┐
+  │ 1. 输入网格数据（SOA布局的5个通道）                    │
+  │ 2. 系数裁剪：标记均匀区域Tile，跳过系数内存读取        │
+  │ 3. 建立多重网格层级（Coarsening）:                     │
+  │    8-to-1 限制 + 常数延长，逐层构建直到最小维度=8       │
+  │ 4. PCG迭代循环:                                       │
+  │    a. V-Cycle 预条件（聚合核）:                        │
+  │       - 下行程：RBGS(红) → RBGS(黑) → 残差限制        │
+  │       - 最粗层：10次RBGS精确求解                       │
+  │       - 上行程：延长(×2) → RBGS 平滑                  │
+  │    b. CG迭代更新 x, r, p                              │
+  │    c. 聚合点积（块内并行+全局scan）                    │
+  │    d. 检查残差（固定迭代数，避免CPU-GPU同步）           │
+  │ 5. 输出解 x → 作为投影后的速度场                       │
+  └──────────────────────────────────────────────────────┘
+
+【完整端到端流程总结】
+  N-S方程 → Impulse公式化 → Flow Map + Leapfrog方法(LFM)
+  → 每步投影（Poisson方程）→ 矩阵无关UAAMG预条件
+  → 聚合GPU核(CG+V-Cycle) → 系数裁剪优化
+  → 实时流体模拟输出（256×128×128 @ RTX 4090）
+
+================================================================================
+五、学习方案
+
+第一阶段：数学基础（约2周）
+  - 向量微积分：梯度∇、散度∇·、旋度∇×、Laplace算子∇²
+  - Navier-Stokes方程的理解：各项物理含义
+  - 数值线性代数：大型稀疏矩阵、迭代法（CG/GMRES）
+  - Poisson方程的有限差分离散化（MAC/交错网格）
+
+第二阶段：Impulse方法与流映射（约2周）
+  - Oseledets(1989), Buttke(1992) 的冲量公式推导
+  - 阅读论文：Covector Fluids (Nabizadeh et al. 2022)
+  - 阅读论文：Neural Flow Maps (Deng et al. 2023)
+  - 理解Pullback/Pushforward操作、Flow Map Jacobian
+
+第三阶段：多重网格方法（约2周）
+  - 基础多重网格（Multigrid）原理：平滑 + 粗化 + 延长
+  - 几何多重网格 vs 代数多重网格(AMG)
+  - Galerkin原理：A_{l+1} = R_l A_l P_l
+  - UAAMG（Unsmoothed Aggregation）的特点
+  - 红黑Gauss-Seidel（RBGS）平滑器
+
+第四阶段：GPU编程（约2周）
+  - CUDA基础：线程层次（Block/Thread/Warp）
+  - GPU内存层次：Global/Shared/Register内存
+  - 内存合并访问（Coalesced Access）
+  - SOA vs AOS 数据布局选择
+  - CUDA核聚合优化策略
+  - CUB库的基本使用（exclusive scan）
+
+第五阶段：综合实践（约2周）
+  - 实现简单2D Poisson求解器（CPU版CG）
+  - 移植到GPU（矩阵无关实现）
+  - 添加UAAMG预条件
+  - 实现Tile数据结构 + 聚合核
+  - 添加系数裁剪优化
+  - 集成到完整流体模拟器中进行测试
+
+关键阅读材料：
+  1. Shewchuk 1994 - "An Introduction to the Conjugate Gradient Method Without Agonizing Pain"（CG经典教程）
+  2. Stüben 2001 - "A Review of Algebraic Multigrid"（AMG综述）
+  3. Bolz et al. 2003 - "Sparse Matrix Solvers on GPU"（GPU上CG+Multigrid的早期工作）
+  4. Shao et al. 2022 - 矩阵无关UAAMG的CPU SIMD实现
+  5. Deng et al. 2023 - Neural Flow Maps（LFM的直接前身）
+  6. Nabizadeh et al. 2022 - Covector Fluids（impulse方法的图形学应用）
+
+================================================================================
